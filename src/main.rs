@@ -11,20 +11,19 @@ const ARENA_H: f32 = 640.0;
 
 const PADDLE_MARGIN: f32 = 22.0;
 const PADDLE_W: f32 = 12.0;
-const PADDLE_H: f32 = 100.0;
+const PADDLE_H: f32 = 104.0;
 const BALL_RADIUS: f32 = 6.5;
 
-// Single unified period for BOTH paddles so they remain locked in opposite directions
-const PADDLE_PERIOD: f64 = 2.60;
+// Single unified period for BOTH paddles so they move in strict opposite directions
+const PADDLE_PERIOD: f64 = 2.50;
 
-// Slow, calm transit time range (in seconds) that spans a full paddle cycle
-// so arriving balls can intercept the opposite paddle at ANY vertical height
-const MIN_TRANSIT_TIME: f32 = 1.65;
-const MAX_TRANSIT_TIME: f32 = 3.45;
+// STRICTLY CONSTANT TOTAL SPEED (in pixels/second) for EVERY ball in the simulation:
+// sqrt(vx^2 + vy^2) == TOTAL_BALL_SPEED for all balls at all times!
+const TOTAL_BALL_SPEED: f32 = 350.0;
 
 // Tail rendering parameters
 const TAIL_SEGMENTS: usize = 10;
-const TAIL_DURATION: f32 = 0.16; // Trail length in seconds behind the ball
+const TAIL_DURATION: f32 = 0.15;
 
 const MAX_BALLS: usize = 2500;
 
@@ -78,7 +77,6 @@ fn fold_vertical(u: f32, h_eff: f32) -> f32 {
 }
 
 /// Evaluates the exact `(x, y)` world position of a ball at `elapsed` seconds since `t_start`.
-/// Used both for updating the ball and for rendering its corner-bending tail!
 #[inline(always)]
 fn evaluate_ball_pos(
     ball: &Ball,
@@ -100,8 +98,8 @@ fn evaluate_ball_pos(
 }
 
 /// Computes the vertical center of the left or right paddle at global time `t`.
-/// Left and right paddles share `PADDLE_PERIOD` and are locked 0.5 (180 degrees) out of phase:
-/// when the right paddle hits the top corner, the left paddle hits the bottom corner.
+/// Locked 180 degrees (0.5 period) out of phase so when the right paddle hits the top corner,
+/// the left paddle hits the bottom corner.
 #[inline(always)]
 fn paddle_y_local(t: f64, is_right: bool, h_eff: f32) -> f32 {
     let phase_offset = if is_right { 0.5 } else { 0.0 };
@@ -112,61 +110,102 @@ fn paddle_y_local(t: f64, is_right: bool, h_eff: f32) -> f32 {
     center + max_amp * triangle_wave(phase)
 }
 
-/// Solves for `(vx, vy)` by sweeping arrival times across a full paddle oscillation cycle.
-/// Because `dt` spans `[MIN_TRANSIT_TIME, MAX_TRANSIT_TIME]`, the target paddle sweeps from
-/// top to bottom during that window, allowing us to pick the exact arrival time where the
-/// wall bounce lands at `target_wall_alpha` in `[0.06, 0.94]`.
-fn solve_wide_wall_trajectory(
+/// Solves for a trajectory `(vx, vy, dt)` where:
+/// 1. The ball's total speed is STRICTLY `sqrt(vx^2 + vy^2) == TOTAL_BALL_SPEED`.
+/// 2. At arrival time `t_now + dt`, the ball's folded Y coordinate lands squarely inside the
+///    opposing paddle's vertical span `[paddle_center - max_offset, paddle_center + max_offset]`.
+/// 3. The horizontal wall bounce position `wall_alpha` is as close as possible to `target_wall_alpha`
+///    so balls hit the top and bottom walls all the way across AND travel at different angles
+///    (preventing them from marching as a vertical wall!).
+fn solve_constant_speed_trajectory(
     t_now: f64,
     y_start: f32,
     heading_right: bool,
     w_eff: f32,
     h_eff: f32,
     target_wall_alpha: f32,
-    target_top_wall: bool,
+    prefer_top_wall: bool,
 ) -> (f32, f32) {
-    let mut best_vx = 0.0;
-    let mut best_vy = 0.0;
+    let mut best_vx = if heading_right {
+        w_eff / 2.2
+    } else {
+        -w_eff / 2.2
+    };
+    let mut best_vy = 200.0;
     let mut best_score = f32::MAX;
 
-    let steps = 48;
+    let max_paddle_offset = PADDLE_H * 0.44;
+
+    // Because `sqrt(vx^2 + vy^2) == TOTAL_BALL_SPEED` and `|vx| = w_eff / dt`,
+    // any valid transit time `dt` must be > `w_eff / TOTAL_BALL_SPEED` (~1.11s).
+    // By sweeping candidate transit times `dt` in `[1.45s, 3.60s]`, each `dt` uniquely
+    // determines:
+    //   |vx| = w_eff / dt
+    //   |vy| = sqrt(TOTAL_BALL_SPEED^2 - vx^2)
+    // We then check if the ball's arrival height at `t_now + dt` hits the paddle!
+    let min_dt = (w_eff / (TOTAL_BALL_SPEED * 0.92)).max(1.35);
+    let max_dt = 3.60;
+    let steps = 160;
+
     for i in 0..steps {
         let frac = (i as f32) / ((steps - 1) as f32);
-        let dt = MIN_TRANSIT_TIME + frac * (MAX_TRANSIT_TIME - MIN_TRANSIT_TIME);
-        let t_arrival = t_now + dt as f64;
+        let dt = min_dt + frac * (max_dt - min_dt);
 
+        let abs_vx = w_eff / dt;
+        let vy_sq = TOTAL_BALL_SPEED * TOTAL_BALL_SPEED - abs_vx * abs_vx;
+        if vy_sq <= 100.0 {
+            continue;
+        }
+        let abs_vy = vy_sq.sqrt();
+        let total_dy = abs_vy * dt;
+
+        // Ensure the ball bounces at least once off the top or bottom wall
+        let t_arrival = t_now + dt as f64;
         let paddle_center = paddle_y_local(t_arrival, heading_right, h_eff);
 
-        for &offset_ratio in &[-0.42_f32, -0.20, 0.0, 0.20, 0.42] {
-            let y_target = (paddle_center + offset_ratio * PADDLE_H).clamp(2.0, h_eff - 2.0);
+        // Test both launching UP (`vy = -abs_vy`, hitting top wall first)
+        // and launching DOWN (`vy = +abs_vy`, hitting bottom wall first)
+        for &launch_up in &[true, false] {
+            let vy = if launch_up { -abs_vy } else { abs_vy };
 
-            let (unfolded_y, wall_alpha) = if target_top_wall {
-                // Single bounce off TOP wall (y = 0)
-                let unfolded = -y_target;
-                let alpha = y_start / (y_start + y_target).max(1.0);
-                (unfolded, alpha)
+            // Guarantee the ball actually touches the top or bottom wall during transit
+            let hits_wall = if launch_up {
+                total_dy > y_start + 8.0
             } else {
-                // Single bounce off BOTTOM wall (y = h_eff)
-                let unfolded = 2.0 * h_eff - y_target;
-                let d0 = h_eff - y_start;
-                let d1 = h_eff - y_target;
-                let alpha = d0 / (d0 + d1).max(1.0);
-                (unfolded, alpha)
+                total_dy > (h_eff - y_start) + 8.0
             };
-
-            let vy = (unfolded_y - y_start) / dt;
-            let vx = if heading_right { w_eff / dt } else { -w_eff / dt };
-
-            let mut score = (wall_alpha - target_wall_alpha).abs();
-
-            if vy.abs() > 380.0 {
-                score += (vy.abs() - 380.0) * 0.004;
+            if !hits_wall {
+                continue;
             }
 
-            if score < best_score {
-                best_score = score;
-                best_vx = vx;
-                best_vy = vy;
+            let unfolded_arrival = y_start + vy * dt;
+            let folded_arrival = fold_vertical(unfolded_arrival, h_eff);
+
+            // Check if the ball lands on the opposing paddle at `t_arrival`
+            let paddle_dist = (folded_arrival - paddle_center).abs();
+            if paddle_dist <= max_paddle_offset {
+                // Compute where the first wall bounce occurs horizontally (`alpha` in `[0, 1]`)
+                let first_wall_alpha = if launch_up {
+                    (y_start / total_dy).clamp(0.0, 1.0)
+                } else {
+                    ((h_eff - y_start) / total_dy).clamp(0.0, 1.0)
+                };
+
+                let mut score = (first_wall_alpha - target_wall_alpha).abs();
+
+                // Slight preference for the requested launch direction so split balls diverge into an 'X'
+                if launch_up != prefer_top_wall {
+                    score += 0.12;
+                }
+
+                // Prefer landing closer to the paddle's inner sweet spot
+                score += (paddle_dist / max_paddle_offset) * 0.04;
+
+                if score < best_score {
+                    best_score = score;
+                    best_vx = if heading_right { abs_vx } else { -abs_vx };
+                    best_vy = vy;
+                }
             }
         }
     }
@@ -176,7 +215,7 @@ fn solve_wide_wall_trajectory(
 
 fn window_conf() -> Conf {
     Conf {
-        window_title: "The Math is Mathing - Anti-Phase + Tails".to_owned(),
+        window_title: "The Math is Mathing - Constant Total Speed + Tails".to_owned(),
         window_width: WIN_WIDTH as i32,
         window_height: WIN_HEIGHT as i32,
         window_resizable: false,
@@ -205,13 +244,13 @@ async fn main() {
     let spawn_initial_ball = |balls: &mut Vec<Ball>, t: f64| {
         balls.clear();
         let y0 = paddle_y_local(t, false, h_eff);
-        let (vx, vy) = solve_wide_wall_trajectory(
+        let (vx, vy) = solve_constant_speed_trajectory(
             t,
             y0,
             true,
             w_eff,
             h_eff,
-            0.22,
+            0.25,
             true,
         );
         balls.push(Ball {
@@ -256,13 +295,16 @@ async fn main() {
             if hit_right || hit_left {
                 let new_heading_right = !ball.heading_right;
                 let impact_x = if hit_right { right_x } else { left_x };
-                let folded_y = ball.y - top_y;
+                let folded_y = (ball.y - top_y).clamp(2.0, h_eff - 2.0);
 
+                // Golden-ratio low-discrepancy target along the walls so every bounce
+                // chooses a distinct angle and wall-impact location while keeping
+                // sqrt(vx^2 + vy^2) == TOTAL_BALL_SPEED!
                 quasi_seq = (quasi_seq + 0.61803398875).fract();
-                let alpha_primary = 0.06 + quasi_seq * 0.88;
+                let alpha_primary = 0.08 + quasi_seq * 0.84;
                 let bounce_top = fastrand::bool();
 
-                let (nvx, nvy) = solve_wide_wall_trajectory(
+                let (nvx, nvy) = solve_constant_speed_trajectory(
                     sim_time,
                     folded_y,
                     new_heading_right,
@@ -281,8 +323,11 @@ async fn main() {
                 ball.color_idx = (ball.color_idx + 1) % (PALETTE.len() as u8);
 
                 if current_count + spawned_balls.len() < MAX_BALLS {
-                    let alpha_split = (1.0 - alpha_primary).clamp(0.06, 0.94);
-                    let (svx, svy) = solve_wide_wall_trajectory(
+                    // Pick a significantly different wall target for the split ball so its angle `theta`
+                    // and horizontal velocity `vx = TOTAL_BALL_SPEED * cos(theta)` differ from the
+                    // primary ball, preventing them from moving together as a vertical wall!
+                    let alpha_split = (1.0 - alpha_primary).clamp(0.08, 0.92);
+                    let (svx, svy) = solve_constant_speed_trajectory(
                         sim_time,
                         folded_y,
                         new_heading_right,
@@ -319,19 +364,17 @@ async fn main() {
         draw_rectangle(ARENA_X, ARENA_Y, ARENA_W, ARENA_H, WHITE);
         draw_rectangle_lines(ARENA_X, ARENA_Y, ARENA_W, ARENA_H, 5.0, BLACK);
 
-        // Pass 1: Draw all ball tails first so ball heads sit cleanly on top
+        // Pass 1: Draw all ball tails
         for ball in &balls {
             let base_col = PALETTE[ball.color_idx as usize];
             let elapsed = (sim_time - ball.t_start) as f32;
 
-            // Sample backwards in time along the ball's analytical path
             let mut prev_pos = (ball.x, ball.y);
             for s in 1..=TAIL_SEGMENTS {
                 let frac = (s as f32) / (TAIL_SEGMENTS as f32);
                 let past_elapsed = (elapsed - frac * TAIL_DURATION).max(0.0);
                 let curr_pos = evaluate_ball_pos(ball, past_elapsed, left_x, right_x, top_y, h_eff);
 
-                // Taper thickness and fade alpha toward the tip of the tail
                 let inv_frac = 1.0 - frac;
                 let thickness = (BALL_RADIUS * 1.65) * inv_frac.powf(0.85);
                 let alpha = 0.42 * inv_frac.powf(1.2);
@@ -354,7 +397,7 @@ async fn main() {
             }
         }
 
-        // Pass 2: Draw crisp ball heads on top of the trails
+        // Pass 2: Draw ball heads
         for ball in &balls {
             let fill = PALETTE[ball.color_idx as usize];
             draw_circle(ball.x, ball.y, BALL_RADIUS, BLACK);

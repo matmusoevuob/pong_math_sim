@@ -1,22 +1,23 @@
 # Pong Math Simulation
 
-A Rust + Macroquad experiment in procedural motion and geometric chaos. Two paddles sweep in sync on a shared oscillation cycle while colored balls ricochet through the arena, each collision generating a new branch of motion that keeps the system alive and expanding.
+A small Rust + Macroquad artwork that turns Pong into a self-sustaining mathematical system. Two paddles move in a shared oscillation cycle while colorful balls reflect between the arena walls, creating branching motion patterns as each impact generates new trajectories.
 
-## What it does
+## Overview
 
-- Simulates a Pong-inspired arena with two vertical paddles.
-- Uses a fixed 120 Hz update loop for deterministic motion.
-- Keeps paddles locked in anti-phase so they move in a coordinated rhythm.
-- Solves ball trajectories to hit the top or bottom wall at a variety of positions.
-- Spawns complementary balls at paddle impacts, creating a branching field of paths.
-- Caps the system at 3,000 balls to keep the scene visually manageable.
+This project creates a stylized Pong-like simulation where:
+
+- both paddles sweep vertically in a synchronized anti-phase rhythm
+- the ball update loop runs at a fixed 120 Hz
+- each paddle hit chooses a new wall-targeted trajectory
+- companion balls can split off from a collision, creating a growing field of paths
+- the simulation is capped at 3,000 balls to keep the scene stable
 
 ## Requirements
 
 - Rust toolchain with Cargo
-- A desktop environment capable of running Macroquad applications
+- a desktop environment capable of running a Macroquad window
 
-## Run it
+## Run
 
 From the project directory:
 
@@ -24,7 +25,7 @@ From the project directory:
 cargo run --release
 ```
 
-To build only:
+To build without launching the app:
 
 ```sh
 cargo build --release
@@ -32,19 +33,19 @@ cargo build --release
 
 ## Controls
 
-- `R`: reset the simulation to its initial configuration
+- `R`: reset the simulation to its initial state
 - `Esc`: close the window
 
-## Notes on the simulation
+## Simulation details
 
 - The paddles share a single oscillation period and remain offset by 180 degrees.
-- Ball trajectories are computed to spread across a broad range of wall-hit positions instead of repeating the same pattern.
-- The wall target sequence is intentionally quasi-random to avoid clustering and create a more organic visual field.
-- The system evolves continuously, with new branches being created as balls interact with the paddles.
+- Trajectories are chosen to cover a wide range of wall-hit positions instead of repeating a narrow pattern.
+- A quasi-random target sequence helps the motion spread evenly across the arena.
+- Resetting restores the first ball and clears the active branching system.
 
-## Project details
+## Project info
 
 - Language: Rust
-- Graphics: Macroquad
+- Graphics library: Macroquad
 - Window size: 540 x 960
-- Simulation step: 1/120 seconds
+- Fixed step: 1/120 seconds
