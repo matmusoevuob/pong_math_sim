@@ -1,6 +1,6 @@
 use macroquad::prelude::*;
 
-// Arena & Entity Constants
+// Window & Arena Constants
 const WIN_WIDTH: f32 = 540.0;
 const WIN_HEIGHT: f32 = 960.0;
 
@@ -9,21 +9,22 @@ const ARENA_Y: f32 = 140.0;
 const ARENA_W: f32 = 460.0;
 const ARENA_H: f32 = 640.0;
 
-const PADDLE_MARGIN: f32 = 24.0;
+const PADDLE_MARGIN: f32 = 22.0;
 const PADDLE_W: f32 = 12.0;
-const PADDLE_H: f32 = 95.0;
+const PADDLE_H: f32 = 100.0;
 const BALL_RADIUS: f32 = 6.5;
 
-// Harmonic Period of Paddles (in seconds)
-const PADDLE_PERIOD: f32 = 1.60;
+// Slower, smooth paddle periods with an irrational/coprime ratio (Phi-like)
+// so left and right paddles constantly explore new (y_0, y_1) height combinations!
+const LEFT_PADDLE_PERIOD: f64 = 2.80;
+const RIGHT_PADDLE_PERIOD: f64 = 2.15;
 
-// Maximum balls to prevent GPU vertex buffer saturation
-const MAX_BALLS: usize = 4096;
+// Slow, satisfying transit time range (in seconds) to cross the screen
+const MIN_TRANSIT_TIME: f32 = 1.85;
+const MAX_TRANSIT_TIME: f32 = 3.20;
 
-/// Cache-friendly 32-byte aligned Ball representation.
-/// Instead of incrementally integrating `y += vy * dt` (which accumulates float drift),
-/// we store the exact departure state and evaluate the unfolded triangle-wave reflection analytically,
-/// while also maintaining `x, y, vx, vy` for crisp visual rendering.
+const MAX_BALLS: usize = 3000;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 struct Ball {
@@ -48,7 +49,7 @@ const PALETTE: &[Color] = &[
     Color::new(0.91, 0.12, 0.39, 1.0), // Pink
 ];
 
-/// Triangle wave oscillating in [-1.0, 1.0] with period 1.0
+/// Smoothly rounded triangle wave in [-1.0, 1.0] with period 1.0
 #[inline(always)]
 fn triangle_wave(phase: f64) -> f32 {
     let p = phase.rem_euclid(1.0) as f32;
@@ -61,80 +62,153 @@ fn triangle_wave(phase: f64) -> f32 {
     }
 }
 
-/// Folds an unbounded vertical coordinate `u` into the valid bounce range `[0, h_eff]`
+/// Folds an unbounded vertical coordinate `u` into `[0, h_eff]`
 #[inline(always)]
-fn fold_vertical(u: f32, h_eff: f32) -> (f32, f32) {
+fn fold_vertical(u: f32, h_eff: f32) -> f32 {
     let period = 2.0 * h_eff;
     let m = u.rem_euclid(period);
     if m <= h_eff {
-        (m, 1.0)
+        m
     } else {
-        (period - m, -1.0)
+        period - m
     }
 }
 
-/// Computes the vertical center of the left and right paddles at global time `t` (in local `[0, h_eff]` space).
-/// Left and right paddles run 180 degrees (0.5 period) out of phase for visual symmetry.
+/// Computes the vertical center of the left or right paddle at global time `t`.
+/// Using two distinct periods ensures `(y_depart, y_arrive)` pairs cover all ratios,
+/// which is the geometric requirement for wall bounces to span [0, W_eff].
 #[inline(always)]
 fn paddle_y_local(t: f64, is_right: bool, h_eff: f32) -> f32 {
-    let phase_offset = if is_right { 0.5 } else { 0.0 };
-    let phase = (t / PADDLE_PERIOD as f64) + phase_offset;
+    let period = if is_right {
+        RIGHT_PADDLE_PERIOD
+    } else {
+        LEFT_PADDLE_PERIOD
+    };
+    let phase_offset = if is_right { 0.37 } else { 0.0 };
+    let phase = (t / period) + phase_offset;
+
     let center = h_eff * 0.5;
-    // Keep paddle within arena bounds
-    let max_amp = (h_eff - PADDLE_H) * 0.5;
+    // Allow paddles to sweep all the way to the top and bottom walls
+    let max_amp = (h_eff - PADDLE_H * 0.85) * 0.5;
     center + max_amp * triangle_wave(phase)
 }
 
-/// Solves for the exact `(vx, vy)` vector so a ball leaving `(x_start, y_local)` at `t_now`
-/// lands squarely on the opposite paddle after `k` top/bottom wall bounces.
-#[inline]
-fn compute_synchronized_velocity(
+/// Solves for `(vx, vy)` by choosing a slow transit time `dt` and bounce mode `k`
+/// such that the horizontal wall-impact fraction `alpha = x_wall / w_eff` matches
+/// `target_wall_alpha` (e.g. 0.10 = near departure wall, 0.50 = middle, 0.90 = near arrival wall).
+fn solve_wide_wall_trajectory(
     t_now: f64,
-    y_local: f32,
+    y_start: f32,
     heading_right: bool,
     w_eff: f32,
     h_eff: f32,
-    half_periods: u32, // Transit time in multiples of (PADDLE_PERIOD / 2)
-    k_bounces: i32,    // Number of vertical wall bounces (-3..=3)
-    paddle_offset: f32,
+    target_wall_alpha: f32, // Desired wall hit location in [0.08, 0.92]
+    prefer_top_wall: bool,
+    allow_double_bounce: bool,
 ) -> (f32, f32) {
-    let transit_time = (half_periods as f32) * (PADDLE_PERIOD * 0.5);
-    let t_arrival = t_now + transit_time as f64;
+    let mut best_vx = 0.0;
+    let mut best_vy = 0.0;
+    let mut best_score = f32::MAX;
 
-    let target_y = (paddle_y_local(t_arrival, heading_right, h_eff) + paddle_offset)
-        .clamp(0.0, h_eff);
+    // Sweep candidate slow transit times in [MIN_TRANSIT_TIME, MAX_TRANSIT_TIME]
+    let steps = 28;
+    for i in 0..steps {
+        let frac = (i as f32) / ((steps - 1) as f32);
+        let dt = MIN_TRANSIT_TIME + frac * (MAX_TRANSIT_TIME - MIN_TRANSIT_TIME);
+        let t_arrival = t_now + dt as f64;
 
-    // Unfold the target Y coordinate across `k_bounces` reflections
-    let unfolded_target = if k_bounces.rem_euclid(2) == 0 {
-        (k_bounces as f32) * h_eff + target_y
-    } else {
-        ((k_bounces + 1) as f32) * h_eff - target_y
-    };
+        let paddle_center = paddle_y_local(t_arrival, heading_right, h_eff);
 
-    let vx = if heading_right {
-        w_eff / transit_time
-    } else {
-        -w_eff / transit_time
-    };
-    let vy = (unfolded_target - y_local) / transit_time;
+        // Test hitting near the top edge, center, or bottom edge of the target paddle
+        // to maximize asymmetry between y_start and y_target (which pushes wall hits toward the corners!)
+        for &paddle_offset_factor in &[-0.38_f32, 0.0, 0.38] {
+            let y_target = (paddle_center + paddle_offset_factor * PADDLE_H)
+                .clamp(4.0, h_eff - 4.0);
 
-    (vx, vy)
+            // Evaluate 1-bounce (k = -1 top wall, k = 1 bottom wall) and optional 2-bounce (k = ±2)
+            let k_candidates: &[i32] = if allow_double_bounce {
+                &[-1, 1, -2, 2]
+            } else if prefer_top_wall {
+                &[-1, 1]
+            } else {
+                &[1, -1]
+            };
+
+            for &k in k_candidates {
+                // Compute unfolded target Y and exact horizontal wall impact fraction `alpha`
+                let (unfolded_y, wall_alpha) = match k {
+                    -1 => {
+                        // Single bounce off TOP wall (y = 0)
+                        let unfolded = -y_target;
+                        let alpha = y_start / (y_start + y_target).max(1.0);
+                        (unfolded, alpha)
+                    }
+                    1 => {
+                        // Single bounce off BOTTOM wall (y = h_eff)
+                        let unfolded = 2.0 * h_eff - y_target;
+                        let d0 = h_eff - y_start;
+                        let d1 = h_eff - y_target;
+                        let alpha = d0 / (d0 + d1).max(1.0);
+                        (unfolded, alpha)
+                    }
+                    -2 => {
+                        // Bounce off TOP wall first, then BOTTOM wall
+                        let unfolded = -2.0 * h_eff + y_target;
+                        let total_dy = (unfolded - y_start).abs().max(1.0);
+                        let first_alpha = y_start / total_dy; // Hits near departure side
+                        (unfolded, first_alpha)
+                    }
+                    2 => {
+                        // Bounce off BOTTOM wall first, then TOP wall
+                        let unfolded = 2.0 * h_eff + y_target;
+                        let total_dy = (unfolded - y_start).abs().max(1.0);
+                        let first_alpha = (h_eff - y_start) / total_dy; // Hits near departure side
+                        (unfolded, first_alpha)
+                    }
+                    _ => unreachable!(),
+                };
+
+                let vy = (unfolded_y - y_start) / dt;
+                let vx = if heading_right { w_eff / dt } else { -w_eff / dt };
+
+                // Penalize deviation from our desired horizontal wall impact point `target_wall_alpha`
+                let mut score = (wall_alpha - target_wall_alpha).abs();
+
+                // Slight preference for the requested wall (top vs bottom) so splits fan out cleanly
+                if (prefer_top_wall && k > 0) || (!prefer_top_wall && k < 0) {
+                    score += 0.08;
+                }
+
+                // Keep vertical speeds calm and visually pleasing (avoid frantic vertical zig-zags)
+                if vy.abs() > 420.0 {
+                    score += (vy.abs() - 420.0) * 0.005;
+                }
+
+                if score < best_score {
+                    best_score = score;
+                    best_vx = vx;
+                    best_vy = vy;
+                }
+            }
+        }
+    }
+
+    (best_vx, best_vy)
 }
 
 fn window_conf() -> Conf {
     Conf {
-        window_title: "The Math is Mathing - Rust Simulation".to_owned(),
+        window_title: "The Math is Mathing - Wide Wall Edition".to_owned(),
         window_width: WIN_WIDTH as i32,
         window_height: WIN_HEIGHT as i32,
         window_resizable: false,
-        sample_count: 4, // 4x MSAA for crisp geometry
+        sample_count: 4,
         ..Default::default()
     }
 }
 
 #[macroquad::main(window_conf)]
 async fn main() {
-    // Effective inner bounds for the ball's center coordinate
     let left_x = ARENA_X + PADDLE_MARGIN + PADDLE_W + BALL_RADIUS;
     let right_x = ARENA_X + ARENA_W - PADDLE_MARGIN - PADDLE_W - BALL_RADIUS;
     let w_eff = right_x - left_x;
@@ -143,60 +217,50 @@ async fn main() {
     let bottom_y = ARENA_Y + ARENA_H - BALL_RADIUS;
     let h_eff = bottom_y - top_y;
 
-    // Pre-allocate buffers to avoid heap allocations during the hot simulation loop
     let mut balls: Vec<Ball> = Vec::with_capacity(MAX_BALLS);
     let mut spawned_balls: Vec<Ball> = Vec::with_capacity(512);
 
     let mut sim_time: f64 = 0.0;
-    let fixed_dt: f64 = 1.0 / 120.0; // Fixed 120Hz physics clock for deterministic sync
+    let fixed_dt: f64 = 1.0 / 120.0; // Fixed 120Hz step
 
-    // Spawn the initial seed ball on the left paddle face
-    let init_y_local = paddle_y_local(sim_time, false, h_eff);
-    let (init_vx, init_vy) = compute_synchronized_velocity(
-        sim_time,
-        init_y_local,
-        true,
-        w_eff,
-        h_eff,
-        2, // 1 full period transit
-        1, // 1 wall bounce
-        0.0,
-    );
+    // Helper closure to spawn initial ball
+    let spawn_initial_ball = |balls: &mut Vec<Ball>, t: f64| {
+        balls.clear();
+        let y0 = paddle_y_local(t, false, h_eff);
+        let (vx, vy) = solve_wide_wall_trajectory(
+            t,
+            y0,
+            true,
+            w_eff,
+            h_eff,
+            0.25, // Hit the top wall 25% of the way across
+            true,
+            false,
+        );
+        balls.push(Ball {
+            x: left_x,
+            y: top_y + y0,
+            vx,
+            vy,
+            t_start: t,
+            y_start: y0,
+            color_idx: 0,
+            heading_right: true,
+        });
+    };
 
-    balls.push(Ball {
-        x: left_x,
-        y: top_y + init_y_local,
-        vx: init_vx,
-        vy: init_vy,
-        t_start: sim_time,
-        y_start: init_y_local,
-        color_idx: 0,
-        heading_right: true,
-    });
+    spawn_initial_ball(&mut balls, sim_time);
 
     loop {
         if is_key_pressed(KeyCode::Escape) {
             break;
         }
-        // Press R to reset the simulation back to 1 ball
         if is_key_pressed(KeyCode::R) {
-            balls.clear();
             sim_time = 0.0;
-            let y0 = paddle_y_local(0.0, false, h_eff);
-            let (vx, vy) = compute_synchronized_velocity(0.0, y0, true, w_eff, h_eff, 2, 1, 0.0);
-            balls.push(Ball {
-                x: left_x,
-                y: top_y + y0,
-                vx,
-                vy,
-                t_start: 0.0,
-                y_start: y0,
-                color_idx: 0,
-                heading_right: true,
-            });
+            spawn_initial_ball(&mut balls, sim_time);
         }
 
-        // --- 1. UPDATE STEP (Deterministic Analytic Evaluation) ---
+        // --- 1. UPDATE STEP ---
         sim_time += fixed_dt;
         spawned_balls.clear();
         let current_count = balls.len();
@@ -212,10 +276,9 @@ async fn main() {
             };
 
             let unfolded_y = ball.y_start + ball.vy * elapsed;
-            let (folded_y, dir_sign) = fold_vertical(unfolded_y, h_eff);
+            let folded_y = fold_vertical(unfolded_y, h_eff);
             ball.y = top_y + folded_y;
 
-            // Check if the ball has reached the opposing paddle plane
             let hit_right = ball.heading_right && ball.x >= right_x;
             let hit_left = !ball.heading_right && ball.x <= left_x;
 
@@ -223,45 +286,43 @@ async fn main() {
                 let new_heading_right = !ball.heading_right;
                 let impact_x = if hit_right { right_x } else { left_x };
 
-                // Pick a synchronized trajectory for the primary rebounding ball
-                let half_periods = fastrand::u32(1..=2); // Fast or medium crossing speed
-                let k_bounces = if fastrand::bool() { 1 } else { -1 } * fastrand::i32(1..=2);
-                let offset = (fastrand::f32() - 0.5) * (PADDLE_H * 0.45);
+                // Pick a target wall bounce position near the left/early side (0.10 .. 0.45)
+                // or right/late side (0.55 .. 0.90) so balls hit ALL along the top & bottom walls!
+                let alpha_primary = fastrand::f32() * 0.80 + 0.10;
+                let prefer_top = fastrand::bool();
+                let allow_double = fastrand::f32() < 0.35;
 
-                let (nvx, nvy) = compute_synchronized_velocity(
+                let (nvx, nvy) = solve_wide_wall_trajectory(
                     sim_time,
                     folded_y,
                     new_heading_right,
                     w_eff,
                     h_eff,
-                    half_periods,
-                    k_bounces,
-                    offset,
+                    alpha_primary,
+                    prefer_top,
+                    allow_double,
                 );
 
                 ball.x = impact_x;
                 ball.vx = nvx;
-                ball.vy = nvy * dir_sign.abs();
+                ball.vy = nvy;
                 ball.t_start = sim_time;
                 ball.y_start = folded_y;
                 ball.heading_right = new_heading_right;
                 ball.color_idx = (ball.color_idx + 1) % (PALETTE.len() as u8);
 
-                // Spawn a split ball with a complementary bounce harmonic if under capacity
+                // Spawn a complementary split ball that hits the OPPOSITE end of the wall (1.0 - alpha_primary)
                 if current_count + spawned_balls.len() < MAX_BALLS {
-                    let alt_k = -k_bounces;
-                    let alt_periods = if half_periods == 1 { 2 } else { 1 };
-                    let alt_offset = -offset;
-
-                    let (svx, svy) = compute_synchronized_velocity(
+                    let alpha_split = (1.0 - alpha_primary).clamp(0.10, 0.90);
+                    let (svx, svy) = solve_wide_wall_trajectory(
                         sim_time,
                         folded_y,
                         new_heading_right,
                         w_eff,
                         h_eff,
-                        alt_periods,
-                        alt_k,
-                        alt_offset,
+                        alpha_split,
+                        !prefer_top,
+                        !allow_double,
                     );
 
                     spawned_balls.push(Ball {
@@ -283,24 +344,20 @@ async fn main() {
         // --- 2. RENDER STEP ---
         clear_background(Color::from_rgba(242, 242, 244, 255));
 
-        // Top Header Caption
         let title = "When a game dev decides to";
         let subtitle = "flex his math skills";
         draw_text(title, 78.0, 68.0, 32.0, BLACK);
         draw_text(subtitle, 130.0, 102.0, 32.0, BLACK);
 
-        // Arena Box Background & Border
         draw_rectangle(ARENA_X, ARENA_Y, ARENA_W, ARENA_H, WHITE);
         draw_rectangle_lines(ARENA_X, ARENA_Y, ARENA_W, ARENA_H, 5.0, BLACK);
 
-        // Render Balls
         for ball in &balls {
             let fill = PALETTE[ball.color_idx as usize];
             draw_circle(ball.x, ball.y, BALL_RADIUS, BLACK);
             draw_circle(ball.x, ball.y, BALL_RADIUS - 1.5, fill);
         }
 
-        // Render Synchronized Paddles
         let left_paddle_center = top_y + paddle_y_local(sim_time, false, h_eff);
         let right_paddle_center = top_y + paddle_y_local(sim_time, true, h_eff);
 
@@ -319,7 +376,6 @@ async fn main() {
             BLACK,
         );
 
-        // Bottom Live Counter
         let count_text = format!("Balls: {}", balls.len());
         let text_dims = measure_text(&count_text, None, 38, 1.0);
         draw_text(
