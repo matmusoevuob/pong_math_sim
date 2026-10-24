@@ -1,0 +1,13 @@
+[package]
+name = "pong_math_sim"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+macroquad = "0.4"
+fastrand = "2.1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
