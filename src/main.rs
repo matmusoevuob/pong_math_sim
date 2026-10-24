@@ -11,23 +11,34 @@ const ARENA_H: f32 = 640.0;
 
 const PADDLE_MARGIN: f32 = 22.0;
 const PADDLE_W: f32 = 12.0;
-const PADDLE_H: f32 = 104.0;
+const PADDLE_H: f32 = 100.0;
 const BALL_RADIUS: f32 = 6.5;
 
-// Single crossing time (in seconds) for ALL balls.
-// Because this is constant, |vx| and |vy| are 100% identical for every ball!
-const TRANSIT_TIME: f32 = 2.10;
+// Single unified period for BOTH paddles so they remain locked in opposite directions
+const PADDLE_PERIOD: f64 = 2.60;
 
-const MAX_BALLS: usize = 3000;
+// Slow, calm transit time range (in seconds) that spans a full paddle cycle
+// so arriving balls can intercept the opposite paddle at ANY vertical height
+const MIN_TRANSIT_TIME: f32 = 1.65;
+const MAX_TRANSIT_TIME: f32 = 3.45;
+
+// Tail rendering parameters
+const TAIL_SEGMENTS: usize = 10;
+const TAIL_DURATION: f32 = 0.16; // Trail length in seconds behind the ball
+
+const MAX_BALLS: usize = 2500;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 struct Ball {
     x: f32,
     y: f32,
-    vx: f32, // Always +SPEED_X or -SPEED_X
-    vy: f32, // Always +SPEED_Y or -SPEED_Y
+    vx: f32,
+    vy: f32,
+    t_start: f64,
+    y_start: f32,
     color_idx: u8,
+    heading_right: bool,
 }
 
 const PALETTE: &[Color] = &[
@@ -41,46 +52,131 @@ const PALETTE: &[Color] = &[
     Color::new(0.91, 0.12, 0.39, 1.0), // Pink
 ];
 
-/// Linear triangle wave in [0.0, 1.0] with period 1.0:
-/// phase = 0.0 -> 0.0 (Top wall)
-/// phase = 0.5 -> 1.0 (Bottom wall)
-/// phase = 1.0 -> 0.0 (Top wall)
+/// Linear triangle wave oscillating in [-1.0, 1.0] with period 1.0
 #[inline(always)]
-fn unit_triangle_wave(phase: f64) -> f32 {
+fn triangle_wave(phase: f64) -> f32 {
     let p = phase.rem_euclid(1.0) as f32;
-    if p <= 0.5 {
-        p * 2.0
+    if p < 0.25 {
+        p * 4.0
+    } else if p < 0.75 {
+        2.0 - p * 4.0
     } else {
-        2.0 - p * 2.0
+        p * 4.0 - 4.0
     }
 }
 
-/// Computes the vertical center of the left or right paddle at global time `t`.
-///
-/// Mathematical proof of why the paddles move in opposite directions AND catch every ball:
-/// - A ball with constant |vx| = W_eff / T and |vy| = H_eff / T maps any departure height `y`
-///   to `H_eff - y` after 1 transit `T`.
-/// - If the paddles oscillate with period `P = 2 * T / (2k + 1)` (for example, `P = 2.0 * T / 3.0`),
-///   AND the right paddle is 180 degrees (0.5 period) out of phase with the left paddle:
-///   1) At any instant `t`, `y_right(t) = H_eff - y_left(t)` (they move in exact opposite directions!).
-///   2) After 1 transit `T = 1.5 * P`, `y_right(t + T) = y_right(t + 0.5 * P) = y_left(t)`.
-///      And by introducing a slightly detuned wave speed ratio (e.g. balls travel `1.0 * H_eff` while
-///      paddles sweep at `P = 2.0 * T`), every arrival height `H_eff - y` lands squarely on the opposite paddle!
+/// Folds an unbounded vertical coordinate `u` into `[0, h_eff]`
 #[inline(always)]
-fn paddle_y_local(t: f64, is_right: bool, h_eff: f32, paddle_period: f64) -> f32 {
-    // 0.5 phase offset locks the two paddles in strict opposite (180-degree anti-phase) motion:
-    // when the right paddle touches the top corner, the left paddle touches the bottom corner!
-    let phase_offset = if is_right { 0.5 } else { 0.0 };
-    let u = unit_triangle_wave((t / paddle_period) + phase_offset);
+fn fold_vertical(u: f32, h_eff: f32) -> f32 {
+    let period = 2.0 * h_eff;
+    let m = u.rem_euclid(period);
+    if m <= h_eff {
+        m
+    } else {
+        period - m
+    }
+}
 
-    let min_y = PADDLE_H * 0.42;
-    let max_y = h_eff - PADDLE_H * 0.42;
-    min_y + u * (max_y - min_y)
+/// Evaluates the exact `(x, y)` world position of a ball at `elapsed` seconds since `t_start`.
+/// Used both for updating the ball and for rendering its corner-bending tail!
+#[inline(always)]
+fn evaluate_ball_pos(
+    ball: &Ball,
+    elapsed: f32,
+    left_x: f32,
+    right_x: f32,
+    top_y: f32,
+    h_eff: f32,
+) -> (f32, f32) {
+    let dx = ball.vx * elapsed;
+    let x = if ball.heading_right {
+        left_x + dx
+    } else {
+        right_x + dx
+    };
+    let unfolded_y = ball.y_start + ball.vy * elapsed;
+    let y = top_y + fold_vertical(unfolded_y, h_eff);
+    (x, y)
+}
+
+/// Computes the vertical center of the left or right paddle at global time `t`.
+/// Left and right paddles share `PADDLE_PERIOD` and are locked 0.5 (180 degrees) out of phase:
+/// when the right paddle hits the top corner, the left paddle hits the bottom corner.
+#[inline(always)]
+fn paddle_y_local(t: f64, is_right: bool, h_eff: f32) -> f32 {
+    let phase_offset = if is_right { 0.5 } else { 0.0 };
+    let phase = (t / PADDLE_PERIOD) + phase_offset;
+
+    let center = h_eff * 0.5;
+    let max_amp = (h_eff - PADDLE_H) * 0.5 + BALL_RADIUS;
+    center + max_amp * triangle_wave(phase)
+}
+
+/// Solves for `(vx, vy)` by sweeping arrival times across a full paddle oscillation cycle.
+/// Because `dt` spans `[MIN_TRANSIT_TIME, MAX_TRANSIT_TIME]`, the target paddle sweeps from
+/// top to bottom during that window, allowing us to pick the exact arrival time where the
+/// wall bounce lands at `target_wall_alpha` in `[0.06, 0.94]`.
+fn solve_wide_wall_trajectory(
+    t_now: f64,
+    y_start: f32,
+    heading_right: bool,
+    w_eff: f32,
+    h_eff: f32,
+    target_wall_alpha: f32,
+    target_top_wall: bool,
+) -> (f32, f32) {
+    let mut best_vx = 0.0;
+    let mut best_vy = 0.0;
+    let mut best_score = f32::MAX;
+
+    let steps = 48;
+    for i in 0..steps {
+        let frac = (i as f32) / ((steps - 1) as f32);
+        let dt = MIN_TRANSIT_TIME + frac * (MAX_TRANSIT_TIME - MIN_TRANSIT_TIME);
+        let t_arrival = t_now + dt as f64;
+
+        let paddle_center = paddle_y_local(t_arrival, heading_right, h_eff);
+
+        for &offset_ratio in &[-0.42_f32, -0.20, 0.0, 0.20, 0.42] {
+            let y_target = (paddle_center + offset_ratio * PADDLE_H).clamp(2.0, h_eff - 2.0);
+
+            let (unfolded_y, wall_alpha) = if target_top_wall {
+                // Single bounce off TOP wall (y = 0)
+                let unfolded = -y_target;
+                let alpha = y_start / (y_start + y_target).max(1.0);
+                (unfolded, alpha)
+            } else {
+                // Single bounce off BOTTOM wall (y = h_eff)
+                let unfolded = 2.0 * h_eff - y_target;
+                let d0 = h_eff - y_start;
+                let d1 = h_eff - y_target;
+                let alpha = d0 / (d0 + d1).max(1.0);
+                (unfolded, alpha)
+            };
+
+            let vy = (unfolded_y - y_start) / dt;
+            let vx = if heading_right { w_eff / dt } else { -w_eff / dt };
+
+            let mut score = (wall_alpha - target_wall_alpha).abs();
+
+            if vy.abs() > 380.0 {
+                score += (vy.abs() - 380.0) * 0.004;
+            }
+
+            if score < best_score {
+                best_score = score;
+                best_vx = vx;
+                best_vy = vy;
+            }
+        }
+    }
+
+    (best_vx, best_vy)
 }
 
 fn window_conf() -> Conf {
     Conf {
-        window_title: "The Math is Mathing - Constant Speed Geometry".to_owned(),
+        window_title: "The Math is Mathing - Anti-Phase + Tails".to_owned(),
         window_width: WIN_WIDTH as i32,
         window_height: WIN_HEIGHT as i32,
         window_resizable: false,
@@ -99,137 +195,113 @@ async fn main() {
     let bottom_y = ARENA_Y + ARENA_H - BALL_RADIUS;
     let h_eff = bottom_y - top_y;
 
-    // Constant horizontal and vertical speeds for ALL balls!
-    // In one transit `TRANSIT_TIME`, every ball crosses `w_eff` horizontally
-    // and `h_eff` vertically, meaning |vx| and |vy| NEVER change.
-    let speed_x: f32 = w_eff / TRANSIT_TIME;
-    let speed_y: f32 = h_eff / TRANSIT_TIME;
-
-    // If a ball leaves left paddle at height `y0`, after `TRANSIT_TIME` it arrives at right paddle
-    // at height `y1 = h_eff - y0`.
-    // For the paddles to move in opposite directions (`y_right(t) = h_eff - y_left(t)`) AND be at
-    // `h_eff - y0` at `t + TRANSIT_TIME`, we need `y_right(t + TRANSIT_TIME) = h_eff - y_left(t)`.
-    // Since `y_right(t) = h_eff - y_left(t)`, this requires `y_right(t + TRANSIT_TIME) = y_right(t)`,
-    // which holds whenever `TRANSIT_TIME` is an integer multiple of `paddle_period`!
-    let paddle_period: f64 = TRANSIT_TIME as f64;
-
     let mut balls: Vec<Ball> = Vec::with_capacity(MAX_BALLS);
     let mut spawned_balls: Vec<Ball> = Vec::with_capacity(512);
 
-    let mut sim_time: f64 = 0.0;
-    let fixed_dt: f32 = 1.0 / 120.0;
+    let fixed_dt: f64 = 1.0 / 120.0;
+    let start_t = 0.22 * PADDLE_PERIOD;
+    let mut sim_time: f64 = start_t;
 
-    // Seed the initial ball on the left paddle
-    let spawn_initial = |balls: &mut Vec<Ball>, t: f64| {
+    let spawn_initial_ball = |balls: &mut Vec<Ball>, t: f64| {
         balls.clear();
-        let y0 = paddle_y_local(t, false, h_eff, paddle_period);
+        let y0 = paddle_y_local(t, false, h_eff);
+        let (vx, vy) = solve_wide_wall_trajectory(
+            t,
+            y0,
+            true,
+            w_eff,
+            h_eff,
+            0.22,
+            true,
+        );
         balls.push(Ball {
             x: left_x,
             y: top_y + y0,
-            vx: speed_x,
-            vy: -speed_y, // Starts heading UP-RIGHT
+            vx,
+            vy,
+            t_start: t,
+            y_start: y0,
             color_idx: 0,
+            heading_right: true,
         });
     };
 
-    spawn_initial(&mut balls, sim_time);
+    spawn_initial_ball(&mut balls, sim_time);
+
+    let mut quasi_seq: f32 = 0.15;
 
     loop {
         if is_key_pressed(KeyCode::Escape) {
             break;
         }
         if is_key_pressed(KeyCode::R) {
-            sim_time = 0.0;
-            spawn_initial(&mut balls, sim_time);
+            sim_time = start_t;
+            spawn_initial_ball(&mut balls, sim_time);
         }
 
-        // --- 1. FIXED-TIMESTEP CONSTANT-SPEED PHYSICS ---
-        sim_time += fixed_dt as f64;
+        // --- 1. UPDATE STEP ---
+        sim_time += fixed_dt;
         spawned_balls.clear();
         let current_count = balls.len();
 
-        let left_p_center = paddle_y_local(sim_time, false, h_eff, paddle_period);
-        let right_p_center = paddle_y_local(sim_time, true, h_eff, paddle_period);
-
         for ball in balls.iter_mut() {
-            // Advance X and Y by strictly constant speed_x and speed_y
-            ball.x += ball.vx * fixed_dt;
-            ball.y += ball.vy * fixed_dt;
+            let elapsed = (sim_time - ball.t_start) as f32;
+            let (bx, by) = evaluate_ball_pos(ball, elapsed, left_x, right_x, top_y, h_eff);
+            ball.x = bx;
+            ball.y = by;
 
-            // Exact mirror reflection off TOP and BOTTOM walls (preserves |vy| = speed_y)
-            if ball.y < top_y {
-                ball.y = top_y + (top_y - ball.y);
-                ball.vy = speed_y;
-            } else if ball.y > bottom_y {
-                ball.y = bottom_y - (ball.y - bottom_y);
-                ball.vy = -speed_y;
-            }
-
-            // Check impact with RIGHT or LEFT paddle plane
-            let hit_right = ball.vx > 0.0 && ball.x >= right_x;
-            let hit_left = ball.vx < 0.0 && ball.x <= left_x;
+            let hit_right = ball.heading_right && ball.x >= right_x;
+            let hit_left = !ball.heading_right && ball.x <= left_x;
 
             if hit_right || hit_left {
-                let paddle_center_local = if hit_right {
-                    right_p_center
-                } else {
-                    left_p_center
-                };
+                let new_heading_right = !ball.heading_right;
+                let impact_x = if hit_right { right_x } else { left_x };
+                let folded_y = ball.y - top_y;
 
-                // Reflect X coordinate cleanly off the paddle face and flip vx sign
-                if hit_right {
-                    let overshoot = ball.x - right_x;
-                    ball.x = right_x - overshoot;
-                    ball.vx = -speed_x;
-                } else {
-                    let overshoot = left_x - ball.x;
-                    ball.x = left_x + overshoot;
-                    ball.vx = speed_x;
-                }
+                quasi_seq = (quasi_seq + 0.61803398875).fract();
+                let alpha_primary = 0.06 + quasi_seq * 0.88;
+                let bounce_top = fastrand::bool();
 
+                let (nvx, nvy) = solve_wide_wall_trajectory(
+                    sim_time,
+                    folded_y,
+                    new_heading_right,
+                    w_eff,
+                    h_eff,
+                    alpha_primary,
+                    bounce_top,
+                );
+
+                ball.x = impact_x;
+                ball.vx = nvx;
+                ball.vy = nvy;
+                ball.t_start = sim_time;
+                ball.y_start = folded_y;
+                ball.heading_right = new_heading_right;
                 ball.color_idx = (ball.color_idx + 1) % (PALETTE.len() as u8);
 
-                // Keep the ball locked inside the paddle's vertical span while allowing
-                // a small phase shift along the paddle face so consecutive bounces sweep
-                // across the ENTIRE top and bottom walls instead of repeating a single loop!
-                let local_y = ball.y - top_y;
-                let max_catch_offset = PADDLE_H * 0.44;
-
-                // Primary ball bounces UP (-speed_y) or DOWN (+speed_y)
-                // and shifts slightly toward one end of the paddle face
-                let shift = (fastrand::f32() - 0.5) * 28.0;
-                let new_local_y = (local_y + shift)
-                    .clamp(
-                        (paddle_center_local - max_catch_offset).max(2.0),
-                        (paddle_center_local + max_catch_offset).min(h_eff - 2.0),
-                    );
-                ball.y = top_y + new_local_y;
-
-                // Spawn the split ball heading in the OPPOSITE vertical direction (+speed_y vs -speed_y)
-                // with the exact same constant speed!
                 if current_count + spawned_balls.len() < MAX_BALLS {
-                    let split_shift = (fastrand::f32() - 0.5) * 28.0;
-                    let split_local_y = (local_y + split_shift)
-                        .clamp(
-                            (paddle_center_local - max_catch_offset).max(2.0),
-                            (paddle_center_local + max_catch_offset).min(h_eff - 2.0),
-                        );
-
-                    // Primary goes UP (-speed_y), Split goes DOWN (+speed_y) -> forms a symmetric 'X' split!
-                    ball.vy = -speed_y;
-                    let split_vy = speed_y;
+                    let alpha_split = (1.0 - alpha_primary).clamp(0.06, 0.94);
+                    let (svx, svy) = solve_wide_wall_trajectory(
+                        sim_time,
+                        folded_y,
+                        new_heading_right,
+                        w_eff,
+                        h_eff,
+                        alpha_split,
+                        !bounce_top,
+                    );
 
                     spawned_balls.push(Ball {
-                        x: ball.x,
-                        y: top_y + split_local_y,
-                        vx: ball.vx,
-                        vy: split_vy,
+                        x: impact_x,
+                        y: top_y + folded_y,
+                        vx: svx,
+                        vy: svy,
+                        t_start: sim_time,
+                        y_start: folded_y,
                         color_idx: fastrand::u8(0..PALETTE.len() as u8),
+                        heading_right: new_heading_right,
                     });
-                } else {
-                    // Once at max capacity, randomly pick UP or DOWN on paddle bounce
-                    // so both diagonals stay evenly populated
-                    ball.vy = if fastrand::bool() { speed_y } else { -speed_y };
                 }
             }
         }
@@ -247,22 +319,62 @@ async fn main() {
         draw_rectangle(ARENA_X, ARENA_Y, ARENA_W, ARENA_H, WHITE);
         draw_rectangle_lines(ARENA_X, ARENA_Y, ARENA_W, ARENA_H, 5.0, BLACK);
 
+        // Pass 1: Draw all ball tails first so ball heads sit cleanly on top
+        for ball in &balls {
+            let base_col = PALETTE[ball.color_idx as usize];
+            let elapsed = (sim_time - ball.t_start) as f32;
+
+            // Sample backwards in time along the ball's analytical path
+            let mut prev_pos = (ball.x, ball.y);
+            for s in 1..=TAIL_SEGMENTS {
+                let frac = (s as f32) / (TAIL_SEGMENTS as f32);
+                let past_elapsed = (elapsed - frac * TAIL_DURATION).max(0.0);
+                let curr_pos = evaluate_ball_pos(ball, past_elapsed, left_x, right_x, top_y, h_eff);
+
+                // Taper thickness and fade alpha toward the tip of the tail
+                let inv_frac = 1.0 - frac;
+                let thickness = (BALL_RADIUS * 1.65) * inv_frac.powf(0.85);
+                let alpha = 0.42 * inv_frac.powf(1.2);
+                let tail_color = Color::new(base_col.r, base_col.g, base_col.b, alpha);
+
+                draw_line(
+                    prev_pos.0,
+                    prev_pos.1,
+                    curr_pos.0,
+                    curr_pos.1,
+                    thickness,
+                    tail_color,
+                );
+                draw_circle(curr_pos.0, curr_pos.1, thickness * 0.5, tail_color);
+
+                prev_pos = curr_pos;
+                if past_elapsed <= 0.0 {
+                    break;
+                }
+            }
+        }
+
+        // Pass 2: Draw crisp ball heads on top of the trails
         for ball in &balls {
             let fill = PALETTE[ball.color_idx as usize];
             draw_circle(ball.x, ball.y, BALL_RADIUS, BLACK);
             draw_circle(ball.x, ball.y, BALL_RADIUS - 1.5, fill);
         }
 
+        // Render Anti-Phase Paddles
+        let left_paddle_center = top_y + paddle_y_local(sim_time, false, h_eff);
+        let right_paddle_center = top_y + paddle_y_local(sim_time, true, h_eff);
+
         draw_rectangle(
             ARENA_X + PADDLE_MARGIN,
-            top_y + left_p_center - PADDLE_H * 0.5,
+            left_paddle_center - PADDLE_H * 0.5,
             PADDLE_W,
             PADDLE_H,
             BLACK,
         );
         draw_rectangle(
             ARENA_X + ARENA_W - PADDLE_MARGIN - PADDLE_W,
-            top_y + right_p_center - PADDLE_H * 0.5,
+            right_paddle_center - PADDLE_H * 0.5,
             PADDLE_W,
             PADDLE_H,
             BLACK,
