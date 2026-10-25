@@ -12,7 +12,7 @@ This project creates a stylized Pong-like simulation where:
 - the ball update loop runs at a fixed 120 Hz
 - each paddle hit chooses a new wall-targeted trajectory
 - companion balls can split off from a collision, creating a growing field of paths
-- the simulation is capped at 3,000 balls to keep the scene stable
+- the simulation is capped at 2,500 balls to maintain smooth 60+ FPS performance
 
 ## Requirements
 

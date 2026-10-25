@@ -22,6 +22,8 @@ async fn main() {
     let bottom_y = ARENA_Y + ARENA_H - BALL_RADIUS;
     let h_eff = bottom_y - top_y;
 
+    let renderer = BallRenderer::new();
+
     let mut balls: Vec<Ball> = Vec::with_capacity(MAX_BALLS);
     let mut spawned_balls: Vec<Ball> = Vec::with_capacity(512);
 
@@ -85,9 +87,7 @@ async fn main() {
                 let impact_x = if hit_right { right_x } else { left_x };
                 let folded_y = (ball.y - top_y).clamp(2.0, h_eff - 2.0);
 
-                // Golden-ratio low-discrepancy target along the walls so every bounce
-                // chooses a distinct angle and wall-impact location while keeping
-                // sqrt(vx^2 + vy^2) == TOTAL_BALL_SPEED!
+                // Golden-ratio low-discrepancy target along the walls
                 quasi_seq = (quasi_seq + 0.61803398875).fract();
                 let alpha_primary = 0.08 + quasi_seq * 0.84;
                 let bounce_top = fastrand::bool();
@@ -111,9 +111,6 @@ async fn main() {
                 ball.color_idx = (ball.color_idx + 1) % (PALETTE.len() as u8);
 
                 if current_count + spawned_balls.len() < MAX_BALLS {
-                    // Pick a significantly different wall target for the split ball so its angle `theta`
-                    // and horizontal velocity `vx = TOTAL_BALL_SPEED * cos(theta)` differ from the
-                    // primary ball, preventing them from moving together as a vertical wall!
                     let alpha_split = (1.0 - alpha_primary).clamp(0.08, 0.92);
                     let (svx, svy) = solve_constant_speed_trajectory(
                         sim_time,
@@ -142,7 +139,7 @@ async fn main() {
         balls.extend_from_slice(&spawned_balls);
 
         // --- 2. RENDER STEP ---
-        draw_simulation_frame(sim_time, &balls, left_x, right_x, top_y, h_eff);
+        renderer.draw(sim_time, &balls, left_x, right_x, top_y, h_eff);
 
         next_frame().await;
     }

@@ -52,6 +52,7 @@ async fn main() {
     });
 
     let mut quasi_seq: f32 = 0.15;
+    let renderer = BallRenderer::new();
 
     let rt = render_target(WIN_WIDTH as u32, WIN_HEIGHT as u32);
     let mut camera = Camera2D::from_display_rect(Rect::new(0.0, 0.0, WIN_WIDTH, WIN_HEIGHT));
@@ -166,7 +167,7 @@ async fn main() {
 
         // Render to texture
         set_camera(&camera);
-        draw_simulation_frame(sim_time, &balls, left_x, right_x, top_y, h_eff);
+        renderer.draw(sim_time, &balls, left_x, right_x, top_y, h_eff);
         set_default_camera();
         next_frame().await;
 
