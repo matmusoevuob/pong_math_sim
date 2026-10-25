@@ -2,6 +2,8 @@
 
 A small Rust + Macroquad artwork that turns Pong into a self-sustaining mathematical system. Two paddles move in a shared oscillation cycle while colorful balls reflect between the arena walls, creating branching motion patterns as each impact generates new trajectories.
 
+![Pong Math Simulation Demo](./assets/pong_math_sim.gif)
+
 ## Overview
 
 This project creates a stylized Pong-like simulation where:
@@ -29,6 +31,12 @@ To build without launching the app:
 
 ```sh
 cargo build --release
+```
+
+To re-record the demo animation (requires `ffmpeg`):
+
+```sh
+cargo run --release --example record_gif
 ```
 
 ## Controls
